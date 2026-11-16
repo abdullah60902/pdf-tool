@@ -1,0 +1,41 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --foreground-rgb: 255, 255, 255;
+  --background-start-rgb: 15, 17, 23;
+  --background-end-rgb: 15, 17, 23;
+}
+
+body {
+  color: rgb(var(--foreground-rgb));
+  background: rgb(var(--background-start-rgb));
+}
+
+@layer components {
+  .glass {
+    @apply bg-gray-900/40 backdrop-blur-md border border-gray-800/50 shadow-xl;
+  }
+  
+  .glass-hover {
+    @apply transition-all duration-300 hover:bg-gray-800/60 hover:border-gray-700/50 hover:shadow-cyan-500/10 hover:shadow-2xl;
+  }
+
+  .btn-primary {
+    @apply bg-gradient-to-r from-cyan-500 to-purple-600 text-white font-medium py-2 px-6 rounded-lg transition-all duration-300 hover:scale-105 active:scale-95 shadow-lg shadow-cyan-500/20;
+  }
+}
+
+.animate-glow {
+  animation: glow 2s ease-in-out infinite alternate;
+}
+
+@keyframes glow {
+  from {
+    box-shadow: 0 0 5px #06b6d4, 0 0 10px #06b6d4;
+  }
+  to {
+    box-shadow: 0 0 20px #7c3aed, 0 0 30px #7c3aed;
+  }
+}

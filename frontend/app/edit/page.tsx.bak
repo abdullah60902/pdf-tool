@@ -1,0 +1,610 @@
+"use client"
+
+import React, { useState, useRef, useEffect, useCallback } from 'react'
+import { useFileProcessing } from '@/hooks/useFileProcessing'
+import FileDropzone from '@/components/FileDropzone'
+import { Edit3, Type, Image as ImageIcon, Save, Download, Move, X, Loader2, Plus, Minus, Pen, Highlighter, Eraser, MousePointer2, TextSelect, Undo, Redo } from 'lucide-react'
+import * as pdfjsLib from 'pdfjs-dist';
+
+// Use local worker
+pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.js';
+
+interface EditorElement {
+  id: string;
+  type: 'text' | 'image' | 'draw' | 'rect';
+  x: number;
+  y: number;
+  pageIndex: number;
+  text?: string;
+  fontSize?: number;
+  color?: string;
+  width?: number;
+  height?: number;
+  stroke?: string;
+  strokeWidth?: number;
+  fill?: string;
+  opacity?: number;
+  imageData?: string;
+  scale?: number;
+  pathData?: string;
+}
+
+export default function EditPage() {
+  const [selectedFile, setSelectedFile] = useState<File | null>(null)
+  const [pdfDoc, setPdfDoc] = useState<any>(null)
+  const [totalPages, setTotalPages] = useState(0)
+  const [scale, setScale] = useState(1.0)
+
+  const [tool, setTool] = useState<'select' | 'text' | 'image' | 'pen' | 'highlighter' | 'eraser' | 'edit-text'>('select')
+
+  // History Management
+  const [elements, setElements] = useState<EditorElement[]>([])
+  const [history, setHistory] = useState<EditorElement[][]>([[]]);
+  const [historyIndex, setHistoryIndex] = useState(0);
+
+  // Helper to update state and push to history
+  const setElementsWithHistory = (newElementsOrUpdater: EditorElement[] | ((prev: EditorElement[]) => EditorElement[])) => {
+    setElements(prev => {
+      const next = typeof newElementsOrUpdater === 'function' ? newElementsOrUpdater(prev) : newElementsOrUpdater;
+
+      // If state hasn't actually changed, don't clutter history (optional optimization)
+      if (JSON.stringify(prev) === JSON.stringify(next)) return prev;
+
+      const newHistory = history.slice(0, historyIndex + 1);
+      newHistory.push(next);
+      if (newHistory.length > 50) newHistory.shift(); // Limit to 50 steps
+
+      setHistory(newHistory);
+      setHistoryIndex(newHistory.length - 1);
+
+      return next;
+    });
+  };
+
+  const undo = useCallback(() => {
+    if (historyIndex > 0) {
+      const prevIndex = historyIndex - 1;
+      setHistoryIndex(prevIndex);
+      setElements(history[prevIndex]);
+    }
+  }, [history, historyIndex]);
+
+  const redo = useCallback(() => {
+    if (historyIndex < history.length - 1) {
+      const nextIndex = historyIndex + 1;
+      setHistoryIndex(nextIndex);
+      setElements(history[nextIndex]);
+    }
+  }, [history, historyIndex]);
+
+  // Keyboard Shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+        e.preventDefault();
+        undo();
+      }
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.shiftKey && e.key === 'Z'))) {
+        e.preventDefault();
+        redo();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [undo, redo]);
+
+  const [color, setColor] = useState('#000000')
+  const [brushSize, setBrushSize] = useState(2)
+  const [textSize, setTextSize] = useState(16)
+
+  const { isProcessing, resultUrl, processFiles } = useFileProcessing()
+
+  useEffect(() => {
+    if (!selectedFile) return;
+    const loadPdf = async () => {
+      const arrayBuffer = await selectedFile.arrayBuffer();
+      const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+      const pdf = await loadingTask.promise;
+      setPdfDoc(pdf);
+      setTotalPages(pdf.numPages);
+    };
+    loadPdf();
+  }, [selectedFile]);
+
+  const addElement = (el: Omit<EditorElement, 'id'>) => {
+    setElementsWithHistory(prev => [...prev, { ...el, id: Date.now().toString() + Math.random() }]);
+  };
+
+  const updateElement = (id: string, updates: Partial<EditorElement>) => {
+    setElementsWithHistory(prev => prev.map(el => el.id === id ? { ...el, ...updates } : el));
+  };
+
+  // Separate update for dragging to avoid history spam? 
+  // For now, dragging updates history on every move end? 
+  // No, DraggableElement updates on every move... this will spam history!
+  // FIX: Separate 'active drag' state vs 'committed' state.
+  // Current implementation updates 'elements' on drag. This is bad for history.
+  // Actually, updateElement is called on drag move.
+  // I need to change DraggableElement to only call onUpdate (which calls updateElement) on drag END.
+  // Or: updateElement implementation for direct interaction vs committed history.
+
+  // Let's modify updateElement to accept a 'skipHistory' flag?
+  // Or DraggableElement should manage local state and commit on pointerUp.
+
+  // I will refactor DraggableElement to use local state for dragging and only sync to parent on move end.
+  // Wait, DraggableElement relies on parent state for rendering position?
+  // Yes. If I use local state, the UI will update smoothly. 
+  // Let's implement local drag state in DraggableElement.
+
+  const removeElement = (id: string) => {
+    setElementsWithHistory(prev => prev.filter(el => el.id !== id));
+  };
+
+  const handleSave = async () => {
+    if (!selectedFile || !pdfDoc) return;
+    const operations = await Promise.all(elements.map(async (el) => {
+      const page = await pdfDoc.getPage(el.pageIndex + 1);
+      const viewport = page.getViewport({ scale: scale });
+      const pdfViewport = page.getViewport({ scale: 1.0 });
+      const ratio = pdfViewport.width / viewport.width;
+
+      return {
+        ...el,
+        x: el.x * ratio,
+        y: el.y * ratio,
+        width: (el.width || 0) * ratio,
+        height: (el.height || 0) * ratio,
+        strokeWidth: (el.strokeWidth || 1) * ratio,
+        size: el.fontSize,
+      };
+    }));
+    processFiles('/pdf/edit', [selectedFile], { operations: JSON.stringify(operations) });
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-950 text-gray-100 flex flex-col h-screen overflow-hidden">
+      <div className="bg-gray-900 border-b border-gray-800 p-2 flex items-center justify-between shadow-xl z-20">
+        <div className="flex items-center gap-4">
+          {/* Undo / Redo */}
+          <div className="flex items-center gap-1 bg-gray-800 p-1 rounded-xl shadow-inner border border-gray-700 mr-2">
+            <ToolButton onClick={undo} icon={Undo} title="Undo (Ctrl+Z)" disabled={historyIndex <= 0} />
+            <ToolButton onClick={redo} icon={Redo} title="Redo (Ctrl+Y)" disabled={historyIndex >= history.length - 1} />
+          </div>
+
+          <div className="flex items-center gap-1 bg-gray-800 p-1 rounded-xl shadow-inner border border-gray-700">
+            <ToolButton active={tool === 'select'} onClick={() => setTool('select')} icon={MousePointer2} title="Select / Move" />
+            <div className="w-px h-6 bg-gray-700 mx-1"></div>
+
+            <ToolButton active={tool === 'edit-text'} onClick={() => setTool('edit-text')} icon={TextSelect} title="Edit Existing Text (Magic)" />
+
+            <ToolButton active={tool === 'text'} onClick={() => { setTool('text'); setColor('#000000'); }} icon={Type} title="Add New Text" />
+            <ToolButton active={tool === 'eraser'} onClick={() => setTool('eraser')} icon={Eraser} title="Eraser / Whiteout" />
+
+            <div className="w-px h-6 bg-gray-700 mx-1"></div>
+
+            <ToolButton active={tool === 'pen'} onClick={() => { setTool('pen'); setColor('#be185d'); setBrushSize(2); }} icon={Pen} title="Pen Tool" />
+            <ToolButton active={tool === 'highlighter'} onClick={() => { setTool('highlighter'); setColor('#fde047'); setBrushSize(15); }} icon={Highlighter} title="Highlighter" />
+          </div>
+
+          <div className="flex items-center gap-2">
+            {(tool === 'text' || tool === 'pen' || tool === 'highlighter' || tool === 'edit-text') && (
+              <div className="flex items-center gap-2 border-l border-gray-700 pl-4 animate-in fade-in">
+                <input type="color" value={color} onChange={(e) => setColor(e.target.value)} className="w-8 h-8 rounded cursor-pointer border-none bg-transparent" title="Color" />
+                {(tool === 'pen' || tool === 'highlighter') && (
+                  <select value={brushSize} onChange={(e) => setBrushSize(Number(e.target.value))} className="bg-gray-800 border-gray-700 rounded text-xs py-1">
+                    <option value="2">Thin</option>
+                    <option value="5">Medium</option>
+                    <option value="15">Thick</option>
+                  </select>
+                )}
+                {(tool === 'text' || tool === 'edit-text') && (
+                  <input type="number" value={textSize} onChange={(e) => setTextSize(Number(e.target.value))} className="w-12 bg-gray-800 border-gray-700 rounded text-xs py-1 text-center" />
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="flex items-center gap-4">
+          {selectedFile && !resultUrl && (
+            <button onClick={handleSave} disabled={isProcessing} className="btn-primary bg-pink-600 hover:bg-pink-700 text-white flex gap-2 px-4 py-2 rounded-lg shadow-lg shadow-pink-500/20">
+              {isProcessing ? <Loader2 className="animate-spin" size={18} /> : <Save size={18} />}
+              {isProcessing ? 'Processing...' : 'Save PDF'}
+            </button>
+          )}
+          {resultUrl && (
+            <a href={resultUrl} className="btn-primary bg-green-600 hover:bg-green-700 flex gap-2 px-4 py-2 rounded-lg text-white font-medium shadow-lg">
+              <Download size={18} /> Download
+            </a>
+          )}
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-auto bg-gray-900/50 backdrop-blur-sm p-8 flex flex-col items-center gap-8 custom-scrollbar">
+        {!selectedFile ? (
+          <div className="flex-1 flex items-center justify-center w-full max-w-xl">
+            <FileDropzone onFilesSelected={(files) => setSelectedFile(files[0])} maxFiles={1} />
+          </div>
+        ) : (
+          <div className="flex flex-col gap-8 pb-20 w-fit">
+            <div className="fixed bottom-4 right-4 bg-gray-800 p-2 rounded-full shadow-2xl border border-gray-700 flex gap-2 z-50">
+              <button onClick={() => setScale(s => Math.max(0.5, s - 0.2))} className="p-2 hover:bg-gray-700 rounded-full"><Minus size={16} /></button>
+              <span className="text-xs self-center">{Math.round(scale * 100)}%</span>
+              <button onClick={() => setScale(s => Math.min(3, s + 0.2))} className="p-2 hover:bg-gray-700 rounded-full"><Plus size={16} /></button>
+            </div>
+
+            {pdfDoc && Array.from({ length: totalPages }, (_, i) => (
+              <PageCanvas
+                key={i}
+                pageIndex={i}
+                pdfDoc={pdfDoc}
+                scale={scale}
+                tool={tool}
+                color={color}
+                brushSize={brushSize}
+                textSize={textSize}
+                elements={elements.filter(e => e.pageIndex === i)}
+                onAddElement={(el: any) => addElement({ ...el, pageIndex: i })}
+                onUpdateElement={updateElement} // This still triggers history on every move if DraggableElement isn't fixed
+                // We will create a 'onUpdateFinal' prop or rely on DraggableElement refactor
+                onUpdateElementHistory={(id: string, updates: any) => updateElement(id, updates)}
+                // We'll pass a non-history updater for drag moves
+                onUpdateElementLive={(id: string, updates: any) => {
+                  setElements(prev => prev.map(el => el.id === id ? { ...el, ...updates } : el));
+                }}
+                onRemoveElement={removeElement}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function PageCanvas({ pageIndex, pdfDoc, scale, tool, color, brushSize, textSize, elements, onAddElement, onUpdateElementHistory, onUpdateElementLive, onRemoveElement }: any) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const activePathRef = useRef<SVGPathElement>(null);
+  const activeRectRef = useRef<HTMLDivElement>(null);
+  const renderTaskRef = useRef<any>(null);
+
+  const [loaded, setLoaded] = useState(false);
+  const [textItems, setTextItems] = useState<any[]>([]);
+
+  const isDrawing = useRef(false);
+  const isErasing = useRef(false);
+  const dragStart = useRef({ x: 0, y: 0 });
+  const currentPathString = useRef<string>("");
+
+  useEffect(() => {
+    if (!pdfDoc) return;
+    const renderPage = async () => {
+      if (renderTaskRef.current) try { await renderTaskRef.current.cancel(); } catch (e) { }
+
+      const page = await pdfDoc.getPage(pageIndex + 1);
+      const viewport = page.getViewport({ scale });
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      const context = canvas.getContext('2d');
+      if (!context) return;
+
+      const renderTask = page.render({ canvasContext: context, viewport });
+      renderTaskRef.current = renderTask;
+      try { await renderTask.promise; setLoaded(true); } catch (e) { }
+
+      try {
+        const textContent = await page.getTextContent();
+        const items = textContent.items.map((item: any) => {
+          let x, y, fontSize, width;
+          if (pdfjsLib.Util) {
+            const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
+            fontSize = Math.sqrt(tx[0] * tx[0] + tx[1] * tx[1]);
+            x = tx[4];
+            y = tx[5] - fontSize;
+            width = item.width * (viewport.width / page.getViewport({ scale: 1 }).width);
+          } else {
+            const pdfH = page.getViewport({ scale: 1 }).height;
+            x = item.transform[4] * scale;
+            y = (pdfH - item.transform[5]) * scale - (Math.sqrt(item.transform[3] * item.transform[3]) * scale);
+            fontSize = Math.sqrt(item.transform[3] * item.transform[3]) * scale;
+            width = item.width * scale;
+          }
+          return {
+            id: Math.random().toString(),
+            x: x - 6,
+            y: y + 3, // Shift hitbox DOWN slightly as requested by user's reach
+            fontSize,
+            width: width + 12,
+            height: fontSize + 12, // Much fatter target area
+            text: item.str,
+            origX: x,
+            origY: y,
+            origWidth: width
+          };
+        });
+        setTextItems(items.filter((i: any) => i.text.trim().length > 0));
+      } catch (e) { }
+    };
+    renderPage();
+    return () => { if (renderTaskRef.current) renderTaskRef.current.cancel(); };
+  }, [pdfDoc, pageIndex, scale]);
+
+  const handlePointerDown = (e: React.PointerEvent) => {
+    if (tool === 'select' || tool === 'edit-text') return;
+    const rect = containerRef.current!.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    if (tool === 'text') {
+      onAddElement({ type: 'text', x, y: y - (textSize / 2), text: 'Type Here', fontSize: textSize, color });
+      return;
+    }
+    if (tool === 'eraser') {
+      isErasing.current = true;
+      dragStart.current = { x, y };
+      (e.currentTarget as Element).setPointerCapture(e.pointerId);
+      if (activeRectRef.current) {
+        activeRectRef.current.style.left = `${x}px`;
+        activeRectRef.current.style.top = `${y}px`;
+        activeRectRef.current.style.width = '0px';
+        activeRectRef.current.style.height = '0px';
+        activeRectRef.current.style.display = 'block';
+      }
+      return;
+    }
+    if (tool === 'pen' || tool === 'highlighter') {
+      isDrawing.current = true;
+      currentPathString.current = `M ${x} ${y}`;
+      (e.currentTarget as Element).setPointerCapture(e.pointerId);
+      if (activePathRef.current) {
+        const strokeColor = tool === 'highlighter' && color === '#000000' ? '#fde047' : color;
+        const opacity = tool === 'highlighter' ? 0.4 : 1;
+        activePathRef.current.setAttribute("d", currentPathString.current);
+        activePathRef.current.setAttribute("stroke", strokeColor);
+        activePathRef.current.setAttribute("stroke-width", brushSize.toString());
+        activePathRef.current.setAttribute("opacity", opacity.toString());
+        activePathRef.current.style.display = "block";
+      }
+    }
+  };
+
+  const handlePointerMove = (e: React.PointerEvent) => {
+    const rect = containerRef.current!.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    if (isErasing.current && activeRectRef.current) {
+      const width = x - dragStart.current.x;
+      const height = y - dragStart.current.y;
+      activeRectRef.current.style.width = `${Math.abs(width)}px`;
+      activeRectRef.current.style.height = `${Math.abs(height)}px`;
+      activeRectRef.current.style.left = `${width < 0 ? x : dragStart.current.x}px`;
+      activeRectRef.current.style.top = `${height < 0 ? y : dragStart.current.y}px`;
+      return;
+    }
+
+    if (isDrawing.current && activePathRef.current) {
+      currentPathString.current += ` L ${x} ${y}`;
+      activePathRef.current.setAttribute("d", currentPathString.current);
+    }
+  };
+
+  const handlePointerUp = (e: React.PointerEvent) => {
+    const rect = containerRef.current!.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    if (isErasing.current) {
+      isErasing.current = false;
+      (e.currentTarget as Element).releasePointerCapture(e.pointerId);
+      const width = x - dragStart.current.x;
+      const height = y - dragStart.current.y;
+      if (Math.abs(width) > 5 && Math.abs(height) > 5) {
+        onAddElement({
+          type: 'rect',
+          x: width < 0 ? x : dragStart.current.x,
+          y: height < 0 ? y : dragStart.current.y,
+          width: Math.abs(width),
+          height: Math.abs(height),
+          fill: '#FFFFFF',
+          opacity: 1
+        });
+      }
+      if (activeRectRef.current) activeRectRef.current.style.display = 'none';
+    }
+
+    if (isDrawing.current) {
+      isDrawing.current = false;
+      (e.currentTarget as Element).releasePointerCapture(e.pointerId);
+      const strokeColor = tool === 'highlighter' && color === '#000000' ? '#fde047' : color;
+      const opacity = tool === 'highlighter' ? 0.4 : 1;
+      onAddElement({
+        type: 'draw', x: 0, y: 0, pathData: currentPathString.current,
+        stroke: strokeColor, strokeWidth: brushSize, opacity
+      });
+      if (activePathRef.current) {
+        activePathRef.current.setAttribute("d", "");
+        activePathRef.current.style.display = "none";
+      }
+    }
+  };
+
+  const handleTextLayerClick = (item: any, e: React.MouseEvent) => {
+    if (tool !== 'edit-text') return;
+    e.stopPropagation();
+
+    // Use original coordinates if available to prevent alignment shift
+    const x = (item.origX !== undefined) ? item.origX : item.x;
+    const y = (item.origY !== undefined) ? item.origY : item.y;
+    const w = (item.origWidth !== undefined) ? item.origWidth : item.width;
+
+    // Wider whiteout to cover dots and residue perfectly
+    onAddElement({ type: 'rect', x: x - 4, y: y - 5, width: w + 8, height: item.fontSize + 10, fill: '#FFFFFF', opacity: 1 });
+    // Text placement with original coordinates
+    onAddElement({ type: 'text', x: x, y: y, text: item.text, fontSize: item.fontSize, color: color === '#000000' ? '#000000' : color });
+  };
+
+  return (
+    <div ref={containerRef} className="relative shadow-2xl rounded-sm group mb-8"
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      style={{ touchAction: 'none' }}
+    >
+      <div className="absolute -top-3 -left-3 bg-gray-800 text-gray-400 text-xs px-2 py-1 rounded shadow-md border border-gray-700 z-10">Page {pageIndex + 1}</div>
+      <canvas ref={canvasRef} className={`bg-white transition-opacity ${loaded ? 'opacity-100' : 'opacity-0'}`} />
+      {!loaded && <div className="absolute inset-0 flex items-center justify-center bg-gray-800 animate-pulse"><Loader2 className="animate-spin" /></div>}
+
+      {tool === 'edit-text' && loaded && (
+        <div className="absolute inset-0 pointer-events-none" style={{ zIndex: 50 }}>
+          {textItems.length === 0 && (
+            <div className="absolute top-2 left-2 bg-yellow-100 text-yellow-800 text-xs p-1 rounded z-50">
+              No text detected. Try manual Whiteout.
+            </div>
+          )}
+          {textItems.map((item, idx) => (
+            <div
+              key={item.id || idx}
+              className="absolute cursor-text pointer-events-auto hover:bg-blue-100/30 hover:border-blue-500 transition-colors"
+              style={{
+                left: item.x, top: item.y, width: Math.max(item.width, 10), height: Math.max(item.height, 10),
+                fontSize: item.fontSize, fontFamily: 'sans-serif', color: 'transparent', whiteSpace: 'pre', lineHeight: 1,
+                border: '1px dashed rgba(59, 130, 246, 0.4)'
+              }}
+              onClick={(e) => handleTextLayerClick(item, e)}
+              title="Click to Edit"
+            >
+              {item.text}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <svg className="absolute inset-0 w-full h-full pointer-events-none" style={{ zIndex: 10 }}>
+        {elements.filter((el: EditorElement) => el.type === 'draw').map((el: EditorElement) => (
+          <path key={el.id} d={el.pathData} stroke={el.stroke} strokeWidth={el.strokeWidth} fill="none" strokeLinecap="round" strokeLinejoin="round" opacity={el.opacity} />
+        ))}
+        <path ref={activePathRef} d="" fill="none" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'none' }} />
+      </svg>
+      <div ref={activeRectRef} className="absolute border-2 border-red-500 bg-white/50 pointer-events-none z-50" style={{ display: 'none' }}></div>
+      {elements.map((el: EditorElement) => (
+        <DraggableElement
+          key={el.id}
+          element={el}
+          onUpdateLive={(u: any) => onUpdateElementLive(el.id, u)}
+          onUpdateHistory={(u: any) => onUpdateElementHistory(el.id, u)}
+          onRemove={() => onRemoveElement(el.id)}
+          selected={tool === 'select' || tool === 'edit-text'}
+        />
+      ))}
+    </div>
+  );
+}
+
+function ToolButton({ active, onClick, icon: Icon, title, disabled }: any) {
+  return (
+    <button onClick={onClick} disabled={disabled} className={`p-2 rounded-lg transition-all ${active ? 'bg-pink-600 text-white shadow-lg' : 'text-gray-400 hover:text-white hover:bg-gray-700'} ${disabled ? 'opacity-30 cursor-not-allowed' : ''}`} title={title}>
+      <Icon size={18} />
+    </button>
+  )
+}
+
+function DraggableElement({ element, onUpdateLive, onUpdateHistory, onRemove, selected }: any) {
+  const [isDragging, setIsDragging] = useState(false);
+  const dragStart = useRef({ x: 0, y: 0 });
+
+  if (element.type === 'draw') return null;
+
+  const handlePointerDown = (e: React.PointerEvent) => {
+    if (!selected) return;
+    if ((e.target as HTMLElement).isContentEditable) return;
+    setIsDragging(true);
+    dragStart.current = { x: e.clientX, y: e.clientY };
+    (e.currentTarget as Element).setPointerCapture(e.pointerId);
+    e.stopPropagation();
+  };
+
+  const handlePointerMove = (e: React.PointerEvent) => {
+    if (!isDragging) return;
+    const dx = e.clientX - dragStart.current.x;
+    const dy = e.clientY - dragStart.current.y;
+    onUpdateLive({ x: element.x + dx, y: element.y + dy });
+    dragStart.current = { x: e.clientX, y: e.clientY };
+  };
+
+  const handlePointerUp = (e: React.PointerEvent) => {
+    if (isDragging) {
+      setIsDragging(false);
+      (e.currentTarget as Element).releasePointerCapture(e.pointerId);
+      // Commit final state to history
+      onUpdateHistory({});
+    }
+  };
+
+  const handleWheel = (e: React.WheelEvent) => {
+    if (!selected) return;
+    e.stopPropagation();
+    const delta = e.deltaY * -0.001;
+    let updates = {};
+
+    if (element.type === 'image') updates = { scale: Math.max(0.05, (element.scale || 0.2) + delta) };
+    if (element.type === 'text') updates = { fontSize: Math.max(8, (element.fontSize || 16) + (delta * 50)) };
+    if (element.type === 'rect') {
+      const d = e.deltaY;
+      if (e.shiftKey) updates = { width: Math.max(10, (element.width || 100) - d) };
+      else updates = { height: Math.max(10, (element.height || 30) - d) };
+    }
+
+    if (Object.keys(updates).length > 0) {
+      onUpdateLive(updates);
+      // Debounce history update? Or just update history on every wheel event?
+      // Wheel is high frequency. Better to just update history.
+      onUpdateHistory(updates);
+    }
+  };
+
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        left: element.x,
+        top: element.y,
+        width: element.width,
+        height: element.height,
+        cursor: selected ? 'move' : 'default',
+        border: selected ? '1px dashed #db2777' : 'none',
+      }}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onWheel={handleWheel}
+      className="group"
+    >
+      {selected && (
+        <>
+          <button onPointerDown={(e) => { e.stopPropagation(); onRemove(); }} className="-top-3 -right-3 absolute bg-red-500 rounded-full p-1 shadow-md z-30 transform hover:scale-110"><X size={12} className="text-white" /></button>
+          <div className="-top-3 -left-3 absolute bg-gray-700/80 rounded-full p-1 shadow-md cursor-move z-30"><Move size={12} className="text-white" /></div>
+        </>
+      )}
+
+      {element.type === 'text' && (
+        <div contentEditable={selected && !isDragging} suppressContentEditableWarning
+          onBlur={(e) => onUpdateHistory({ text: e.currentTarget.innerText })}
+          className="outline-none whitespace-nowrap px-1"
+          style={{ color: element.color, fontSize: `${element.fontSize}px`, minWidth: '20px', fontFamily: 'Helvetica, Arial, sans-serif' }}>{element.text}</div>
+      )}
+
+      {element.type === 'image' && (
+        <img src={element.imageData} style={{ transform: `scale(${element.scale})`, transformOrigin: 'top left', pointerEvents: 'none' }} alt="Upload" />
+      )}
+
+      {element.type === 'rect' && (
+        <div style={{ width: '100%', height: '100%', backgroundColor: element.fill, opacity: element.opacity }} className="w-full h-full shadow-sm border border-gray-100"></div>
+      )}
+    </div>
+  )
+}
