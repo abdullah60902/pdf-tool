@@ -3,6 +3,9 @@ backend/node_modules/
 .next/
 .env
 backend/.env
+backend/google-credentials.json
+backend/public/uploads/
+backend/temp/
 .env.*
 *.log
 .DS_Store
