@@ -1,6 +1,8 @@
 node_modules/
+backend/node_modules/
 .next/
 .env
+backend/.env
 .env.*
 *.log
 .DS_Store
